@@ -18,6 +18,12 @@
 
 package org.apache.hudi.util;
 
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.DataStreamSink;
+import org.apache.flink.streaming.api.operators.ProcessOperator;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.types.logical.RowType;
 import org.apache.hudi.client.FlinkTaskContextSupplier;
 import org.apache.hudi.client.HoodieFlinkWriteClient;
 import org.apache.hudi.client.common.HoodieFlinkEngineContext;
@@ -26,6 +32,7 @@ import org.apache.hudi.common.config.SerializableConfiguration;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.engine.EngineType;
 import org.apache.hudi.common.fs.FSUtils;
+import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.util.Option;
@@ -39,6 +46,17 @@ import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.exception.HoodieIOException;
 import org.apache.hudi.schema.FilebasedSchemaProvider;
+import org.apache.hudi.sink.CleanFunction;
+import org.apache.hudi.sink.StreamWriteOperatorFactory;
+import org.apache.hudi.sink.bootstrap.BootstrapFunction;
+import org.apache.hudi.sink.compact.CompactFunction;
+import org.apache.hudi.sink.compact.CompactionCommitEvent;
+import org.apache.hudi.sink.compact.CompactionCommitSink;
+import org.apache.hudi.sink.compact.CompactionPlanEvent;
+import org.apache.hudi.sink.compact.CompactionPlanOperator;
+import org.apache.hudi.sink.partitioner.BucketAssignFunction;
+import org.apache.hudi.sink.partitioner.BucketAssignOperator;
+import org.apache.hudi.sink.transform.RowDataToHoodieFunction;
 import org.apache.hudi.sink.transform.Transformer;
 import org.apache.hudi.sink.transform.ChainedTransformer;
 import org.apache.hudi.streamer.FlinkStreamerConfig;
@@ -325,4 +343,69 @@ public class StreamerUtil {
     }
   }
 
+  public static DataStreamSink<?> createHoodieDataStreamSink(RowType rowType, Configuration conf, int parallelism,
+                                                             StreamWriteOperatorFactory<HoodieRecord> operatorFactory, DataStream<RowData> dataStream) {
+    DataStream<HoodieRecord> dataStream2 = dataStream.map(new RowDataToHoodieFunction<>(rowType, conf),
+            TypeInformation.of(HoodieRecord.class));
+
+    if (conf.getBoolean(FlinkOptions.INDEX_BOOTSTRAP_ENABLED)) {
+      dataStream2 = getIndexBootstrapStream(conf, parallelism, dataStream2);
+    }
+
+    DataStream<Object> pipeline = getPipelineStream(conf, parallelism, operatorFactory, dataStream2);
+    if (StreamerUtil.needsAsyncCompaction(conf)) {
+      return getCompactionCommitDataStreamSink(conf, pipeline); // compaction commit should be singleton
+    } else {
+      return pipeline.addSink(new CleanFunction<>(conf))
+              .setParallelism(1)
+              .name("clean_commits").uid("uid_clean_commits");
+    }
+  }
+
+  public static DataStream<HoodieRecord> getIndexBootstrapStream(Configuration conf, int parallelism,
+                                                                 DataStream<HoodieRecord> hoodieDataStream) {
+    return hoodieDataStream.rebalance()
+            .transform(
+                    "index_bootstrap",
+                    TypeInformation.of(HoodieRecord.class),
+                    new ProcessOperator<>(new BootstrapFunction<>(conf)))
+            .setParallelism(conf.getOptional(FlinkOptions.INDEX_BOOTSTRAP_TASKS).orElse(parallelism))
+            .uid("uid_index_bootstrap_" + conf.getString(FlinkOptions.TABLE_NAME));
+  }
+
+  public static DataStream<Object> getPipelineStream(Configuration conf, int parallelism,
+                                                     StreamWriteOperatorFactory<HoodieRecord> operatorFactory,
+                                                     DataStream<HoodieRecord> hoodieRecordDataStream) {
+    return hoodieRecordDataStream
+            // Key-by record key, to avoid multiple subtasks write to a bucket at the same time
+            .keyBy(HoodieRecord::getRecordKey)
+            .transform(
+                    "bucket_assigner",
+                    TypeInformation.of(HoodieRecord.class),
+                    new BucketAssignOperator<>(new BucketAssignFunction<>(conf)))
+            .uid("uid_bucket_assigner" + conf.getString(FlinkOptions.TABLE_NAME))
+            .setParallelism(conf.getOptional(FlinkOptions.BUCKET_ASSIGN_TASKS).orElse(parallelism))
+            // shuffle by fileId(bucket id)
+            .keyBy(record -> record.getCurrentLocation().getFileId())
+            .transform("hoodie_stream_write", TypeInformation.of(Object.class), operatorFactory)
+            .uid("uid_hoodie_stream_write" + conf.getString(FlinkOptions.TABLE_NAME))
+            .setParallelism(conf.getInteger(FlinkOptions.WRITE_TASKS));
+  }
+
+  public static DataStreamSink<CompactionCommitEvent> getCompactionCommitDataStreamSink(Configuration conf,
+                                                                                        DataStream<Object> pipeline) {
+    return pipeline.transform("compact_plan_generate",
+            TypeInformation.of(CompactionPlanEvent.class),
+            new CompactionPlanOperator(conf))
+            .uid("uid_compact_plan_generate")
+            .setParallelism(1) // plan generate must be singleton
+            .rebalance()
+            .transform("compact_task",
+                    TypeInformation.of(CompactionCommitEvent.class),
+                    new ProcessOperator<>(new CompactFunction(conf)))
+            .setParallelism(conf.getInteger(FlinkOptions.COMPACTION_TASKS))
+            .addSink(new CompactionCommitSink(conf))
+            .name("compact_commit")
+            .setParallelism(1);
+  }
 }

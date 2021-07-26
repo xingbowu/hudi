@@ -85,6 +85,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
+import static org.apache.hudi.util.StreamerUtil.getIndexBootstrapStream;
+
 /**
  * Integration test for Flink Hoodie stream sink.
  */
@@ -320,11 +322,11 @@ public class StreamWriteITCase extends TestLogger {
   private void testWriteToHoodie(
       Transformer transformer,
       Map<String, List<String>> expected) throws Exception {
-
+    int parallelism = 4;
     Configuration conf = TestConfigurations.getDefaultConf(tempFile.getAbsolutePath());
     StreamExecutionEnvironment execEnv = StreamExecutionEnvironment.getExecutionEnvironment();
     execEnv.getConfig().disableObjectReuse();
-    execEnv.setParallelism(4);
+    execEnv.setParallelism(parallelism);
     // set up checkpoint interval
     execEnv.enableCheckpointing(4000, CheckpointingMode.EXACTLY_ONCE);
     execEnv.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
@@ -362,23 +364,10 @@ public class StreamWriteITCase extends TestLogger {
         .map(new RowDataToHoodieFunction<>(rowType, conf), TypeInformation.of(HoodieRecord.class));
 
     if (conf.getBoolean(FlinkOptions.INDEX_BOOTSTRAP_ENABLED)) {
-      hoodieDataStream = hoodieDataStream.transform("index_bootstrap",
-          TypeInformation.of(HoodieRecord.class),
-          new ProcessOperator<>(new BootstrapFunction<>(conf)));
+      hoodieDataStream = getIndexBootstrapStream(conf, parallelism, hoodieDataStream);
     }
 
-    DataStream<Object> pipeline = hoodieDataStream
-        // Key-by record key, to avoid multiple subtasks write to a bucket at the same time
-        .keyBy(HoodieRecord::getRecordKey)
-        .transform(
-            "bucket_assigner",
-            TypeInformation.of(HoodieRecord.class),
-            new BucketAssignOperator<>(new BucketAssignFunction<>(conf)))
-        .uid("uid_bucket_assigner")
-        // shuffle by fileId(bucket id)
-        .keyBy(record -> record.getCurrentLocation().getFileId())
-        .transform("hoodie_stream_write", TypeInformation.of(Object.class), operatorFactory)
-        .uid("uid_hoodie_stream_write");
+    DataStream<Object> pipeline = StreamerUtil.getPipelineStream(conf, parallelism, operatorFactory, hoodieDataStream);
     execEnv.addOperator(pipeline.getTransformation());
 
     JobClient client = execEnv.executeAsync(execEnv.getStreamGraph(conf.getString(FlinkOptions.TABLE_NAME)));
